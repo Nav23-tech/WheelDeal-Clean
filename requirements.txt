@@ -1,0 +1,16 @@
+streamlit
+pandas
+numpy
+scikit-learn
+<<<<<<< HEAD
+xgboost
+shap
+matplotlib
+plotly
+requests
+python-dotenv
+=======
+plotly
+xgboost
+shap
+>>>>>>> 2b394fe4 (Fixed XGBoost & SHAP update)
