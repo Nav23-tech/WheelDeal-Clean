@@ -283,21 +283,24 @@ class WheelDealAI:
                 self.label_encoders[col] = LabelEncoder()
                 df_processed[col + '_encoded'] = self.label_encoders[col].fit_transform(df_processed[col])
             else:
-                df_processed[col + '_encoded'] = df_processed[col].map(
-                    lambda x: self.label_encoders[col].transform([x])[0] 
-                    if x in self.label_encoders[col].classes_ 
-                    else -1
-                )
+                # map unseen labels to -1
+                le = self.label_encoders.get(col, None)
+                if le is None:
+                    df_processed[col + '_encoded'] = -1
+                else:
+                    mapped = []
+                    for v in df_processed[col].values:
+                        if v in list(le.classes_):
+                            mapped.append(int(le.transform([v])[0]))
+                        else:
+                            mapped.append(-1)
+                    df_processed[col + '_encoded'] = mapped
         
         feature_cols = [
             'car_age', 'km_driven', 'engine_cc', 'mileage', 'seats',
             'brand_encoded', 'fuel_type_encoded', 'transmission_encoded', 'owner_type_encoded'
         ]
-<<<<<<< HEAD
-        
-=======
-         
->>>>>>> 2b394fe4 (Fixed XGBoost & SHAP update)
+
         if fit:
             self.feature_names = feature_cols
         
@@ -305,12 +308,21 @@ class WheelDealAI:
     
     def train_model(self, df):
         """Train model"""
-<<<<<<< HEAD
+        # Preprocess & build training set
         X, df_processed = self.preprocess_data(df, fit=True)
+        # y must be taken from original df (price present)
         y = df['price']
         
+        # Ensure numeric
+        X = X.apply(pd.to_numeric, errors="coerce")
+        y = pd.to_numeric(y, errors="coerce")
+        X = X.fillna(0)
+        y = y.fillna(0)
+        
+        # Train split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
+        # Train XGBoost
         self.model = xgb.XGBRegressor(
             n_estimators=100,
             learning_rate=0.1,
@@ -320,62 +332,66 @@ class WheelDealAI:
         )
         self.model.fit(X_train, y_train)
         
-        self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42)
-=======
-       # Preprocess & split
-X, df_processed = self.preprocess_data(df, fit=True)
-y = df_processed['price']
-X = df_processed.drop('price', axis=1)
-
-# Convert all to numbers
-X = X.apply(pd.to_numeric, errors="coerce")
-y = pd.to_numeric(y, errors="coerce")
-
-# Fill missing
-X = X.fillna(0)
-y = y.fillna(0)
-
-# Train split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Train model
-self.model = xgb.XGBRegressor(
-    n_estimators=100,
-    learning_rate=0.1,
-    max_depth=6,
-    random_state=42,
-    objective='reg:squarederror'
-)
-self.model.fit(X_train, y_train)
-
-# SHAP safe init
-self.explainer = shap.Explainer(self.model, X_train)
-
+        # SHAP explainer (safe initialization)
+        try:
+            self.explainer = shap.Explainer(self.model, X_train)
+        except Exception:
+            # fallback
+            try:
+                self.explainer = shap.TreeExplainer(self.model)
+            except Exception:
+                self.explainer = None
         
- self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42)
->>>>>>> 2b394fe4 (Fixed XGBoost & SHAP update)
+        # Anomaly detector
+        self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42)
         self.anomaly_detector.fit(X_train)
         
-        self.explainer = shap.TreeExplainer(self.model)
-        
+        # Evaluate
         test_score = self.model.score(X_test, y_test)
         return test_score
     
     def predict_price(self, input_data):
-        """Predict price"""
+        """Predict price for input_data (DataFrame with same raw columns)"""
         X, _ = self.preprocess_data(input_data, fit=False)
-        return self.model.predict(X)[0]
+        # ensure numeric & same ordering
+        X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
+        pred = self.model.predict(X)
+        # return scalar
+        return float(pred[0])
     
     def get_shap_explanation(self, input_data):
-        """Get SHAP values"""
+        """Get SHAP values and feature importance for an input row"""
         X, _ = self.preprocess_data(input_data, fit=False)
-        shap_values = self.explainer.shap_values(X)
+        X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
         
+        if self.explainer is None:
+            # no explainer available
+            shap_values = np.zeros((1, len(self.feature_names)))
+        else:
+            try:
+                expl = self.explainer(X)
+                # SHAP library returns different types depending on version
+                if hasattr(expl, "values"):
+                    shap_values = np.array(expl.values)
+                else:
+                    shap_values = np.array(expl)
+            except Exception:
+                # fallback: try shap.TreeExplainer
+                try:
+                    te = shap.TreeExplainer(self.model)
+                    shap_values = np.array(te.shap_values(X))
+                except Exception:
+                    shap_values = np.zeros((1, len(self.feature_names)))
+        
+        # Build feature importance dataframe
+        # Ensure shap_values has shape (1, n_features)
+        if shap_values.ndim == 1:
+            shap_values = shap_values.reshape(1, -1)
         feature_importance = pd.DataFrame({
             'feature': self.feature_names,
-            'shap_value': shap_values[0]
+            'shap_value': shap_values[0][:len(self.feature_names)]
         })
-        feature_importance['abs_shap'] = abs(feature_importance['shap_value'])
+        feature_importance['abs_shap'] = feature_importance['shap_value'].abs()
         feature_importance = feature_importance.sort_values('abs_shap', ascending=False)
         
         return feature_importance, shap_values
@@ -383,38 +399,51 @@ self.explainer = shap.Explainer(self.model, X_train)
     def calculate_trust_score(self, input_data, predicted_price):
         """Calculate trust score"""
         X, df_processed = self.preprocess_data(input_data, fit=False)
-        
+        X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
         scores = []
         explanations = []
         
-        anomaly_score = self.anomaly_detector.score_samples(X)[0]
+        # Anomaly sample score (higher = more normal for IsolationForest.score_samples)
+        if self.anomaly_detector is not None:
+            try:
+                anomaly_score = self.anomaly_detector.score_samples(X)[0]
+            except Exception:
+                anomaly_score = 0.0
+        else:
+            anomaly_score = 0.0
         anomaly_points = min(40, max(0, (anomaly_score + 0.5) * 40))
         scores.append(anomaly_points)
         explanations.append(f"Pattern Analysis: {anomaly_points:.1f}/40")
         
-        car_age = df_processed['car_age'].values[0]
+        # Age consistency
+        car_age = int(df_processed['car_age'].values[0])
         expected_depreciation = 0.92 ** car_age
         age_consistency = min(20, 20 * expected_depreciation)
         scores.append(age_consistency)
         explanations.append(f"Age Consistency: {age_consistency:.1f}/20")
         
-        km_driven = input_data['km_driven'].values[0]
-        expected_km = car_age * 15000
-        km_ratio = min(km_driven / expected_km, expected_km / km_driven) if expected_km > 0 else 1
+        # Mileage check
+        km_driven = float(input_data['km_driven'].values[0])
+        expected_km = car_age * 15000 if car_age > 0 else 15000
+        km_ratio = min(km_driven / expected_km, expected_km / km_driven) if expected_km > 0 and km_driven > 0 else 1
         mileage_points = 20 * km_ratio
         scores.append(mileage_points)
         explanations.append(f"Mileage Check: {mileage_points:.1f}/20")
         
-        if predicted_price > 50000 and predicted_price < 5000000:
+        # Price validity
+        if 50000 < predicted_price < 5000000:
             price_points = 20
-        elif predicted_price > 30000 and predicted_price < 10000000:
+        elif 30000 < predicted_price < 10000000:
             price_points = 15
         else:
             price_points = 10
         scores.append(price_points)
         explanations.append(f"Price Validity: {price_points:.1f}/20")
         
-        return sum(scores), explanations
+        total = sum(scores)
+        # Normalize to 0-100 if rounding issues
+        total = max(0, min(100, total))
+        return total, explanations
     
     def get_trust_category(self, score):
         """Categorize trust score"""
@@ -448,7 +477,11 @@ with st.sidebar:
             st.session_state.trained = True
             st.balloons()
             st.success(f"✅ AI Ready!")
-            st.metric("Accuracy", f"{test_score*100:.1f}%")
+            # show percentage
+            try:
+                st.metric("Accuracy", f"{test_score*100:.1f}%")
+            except Exception:
+                st.metric("Accuracy", "N/A")
     
     if st.session_state.trained:
         st.success("🤖 AI Active")
